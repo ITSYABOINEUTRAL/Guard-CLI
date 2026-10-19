@@ -663,8 +663,16 @@ pub fn scan_directory_with_checks(
 /// findings. The one difference from [`scan_directory`] is that this does not walk a
 /// directory: only the paths passed in are considered.
 ///
+/// Paths with a `target` or `.git` component below `root` are skipped, the same
+/// skip-list [`scan_directory`]'s walk applies (see [`is_ignored_path`]).
+///
 /// Returns `(findings, files_scanned, files_skipped, check_panics)` where `check_panics`
 /// lists every check that panicked during the scan (see [`CheckPanicReport`]).
+///
+/// This is library API for callers that already have a file list (a pre-commit hook
+/// scanning staged files, an editor integration). The `soroban-guard` CLI does not call
+/// it; it goes through [`scan_directory_with_checks`]. `tests/scan_files_api.rs`
+/// exercises it through the public interface.
 pub fn scan_files(
     paths: &[PathBuf],
     root: &Path,
@@ -678,6 +686,10 @@ pub fn scan_files(
     let mut selected = Vec::new();
     let mut files_skipped = 0;
     for path in paths {
+        // Match the directory walk: build output and VCS internals are never scanned.
+        if is_ignored_path(path.strip_prefix(&root).unwrap_or(path)) {
+            continue;
+        }
         let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let label = path_canon.strip_prefix(&root).unwrap_or(&path_canon);
         match classify_rust_path(&path_canon, label, &exclude_patterns, &include_patterns)? {
