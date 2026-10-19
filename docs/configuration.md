@@ -15,7 +15,8 @@ project-wide defaults so contributors and CI don't have to repeat CLI flags.
   anywhere in the file, see below — the scan exits with code `2` and an error
   message pointing at the file and the offending key.
 - CLI flags always take precedence over the config file. `--fail-on` overrides
-  `[scan] min_severity`; `--disable-check` is merged with `[checks] disabled`.
+  `[scan] min_severity`; `--disable-check` is merged with `[checks] disabled`;
+  a positional scan path overrides `[scan] path`.
 
 ## Schema
 
@@ -26,6 +27,11 @@ rather than silently ignoring it.
 
 ```toml
 [scan]
+# Directory or file to scan when `soroban-guard scan` is run with no path
+# argument. Only read from the config found from the current directory, and a
+# relative value is resolved against the current directory.
+path = "contracts/token"
+
 # Severity threshold for the `--fail-on` exit gate. One of "high", "medium", "low".
 # Equivalent to the `--fail-on` flag; the flag wins if both are set.
 # Does not filter findings out of the printed output.
@@ -49,6 +55,7 @@ extra = ["drain", "sweep", "rescue_funds"]
 
 | Key | Type | Default | Effect |
 |-----|------|---------|--------|
+| `[scan] path` | string | unset | Scan path used when `scan` is given no positional path. The config is looked up from the current directory (same upward search as above), and a relative value is resolved against the current directory, not the config file's location. If neither a path argument nor this key is set, the scan exits `2`. |
 | `[scan] min_severity` | `"high"` \| `"medium"` \| `"low"` | unset | Same as `--fail-on`: exit `1` when a finding at or above this severity is present. |
 | `[checks] disabled` | list of strings | `[]` | Check names to skip, merged with any `--disable-check` flags. Unknown names cause the scan to exit `2`. |
 | `[checks.sensitive_names] extra` | list of strings | `[]` | Additional function-name patterns treated as privileged/admin-like, appended to the built-in list used **only** by `unprotected-admin`. Other checks (`missing-zero-address-check`, `unprotected-upgrade`, `unprotected-token-mint`, `unprotected-contract-deployment`) maintain their own separate hardcoded lists and are not affected by this option. |
@@ -73,4 +80,18 @@ extra = ["drain"]
 
 ```bash
 soroban-guard scan .
+```
+
+To make a bare `soroban-guard scan` work from the repository root, set the
+default path as well:
+
+```toml
+[scan]
+path = "contracts/token"
+min_severity = "medium"
+```
+
+```bash
+soroban-guard scan            # scans contracts/token
+soroban-guard scan other/dir  # the argument wins over [scan] path
 ```
