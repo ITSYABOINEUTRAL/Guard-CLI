@@ -87,25 +87,25 @@ pub struct CheckPanic {
     pub message: String,
 }
 
-impl From<&ScanError> for CheckPanic {
-    fn from(err: &ScanError) -> Self {
+/// Only [`ScanError::CheckPanic`] carries a check name and a panic message, so it is
+/// the only variant that converts. Any other error is handed back unchanged instead
+/// of being dressed up as an "unknown" panic with an empty path, which would make a
+/// parse or IO failure look like a bug in a check.
+impl<'a> TryFrom<&'a ScanError> for CheckPanic {
+    type Error = &'a ScanError;
+
+    fn try_from(err: &'a ScanError) -> Result<Self, Self::Error> {
         match err {
             ScanError::CheckPanic {
                 check,
                 path,
                 message,
-            } => CheckPanic {
+            } => Ok(CheckPanic {
                 check: check.clone(),
                 path: path.clone(),
                 message: message.clone(),
-            },
-            // Only CheckPanic errors are ever converted; fall back to a best-effort
-            // representation for any other variant so callers never panic.
-            other => CheckPanic {
-                check: "unknown".to_string(),
-                path: PathBuf::new(),
-                message: other.to_string(),
-            },
+            }),
+            other => Err(other),
         }
     }
 }
@@ -135,6 +135,34 @@ impl CheckPanicReport {
     /// Whether the report carries no panics.
     pub fn is_empty(&self) -> bool {
         self.panics.is_empty()
+    }
+
+    /// Build a report from the `check_panics` a scan returns. A
+    /// [`ScanError::Multiple`] is searched recursively.
+    ///
+    /// Any variant other than [`ScanError::CheckPanic`] is a real scan failure, not
+    /// a panic, so it is returned as the error rather than dropped: an empty report
+    /// would claim "not degraded" about a scan that never finished.
+    pub fn from_errors<'a, I>(errors: I) -> Result<Self, &'a ScanError>
+    where
+        I: IntoIterator<Item = &'a ScanError>,
+    {
+        fn collect<'a>(
+            err: &'a ScanError,
+            panics: &mut Vec<CheckPanic>,
+        ) -> Result<(), &'a ScanError> {
+            if let ScanError::Multiple(inner) = err {
+                return inner.iter().try_for_each(|e| collect(e, panics));
+            }
+            panics.push(CheckPanic::try_from(err)?);
+            Ok(())
+        }
+
+        let mut panics = Vec::new();
+        for err in errors {
+            collect(err, &mut panics)?;
+        }
+        Ok(CheckPanicReport { panics })
     }
 }
 
@@ -1310,12 +1338,64 @@ mod tests {
             other => panic!("expected CheckPanic, got {other:?}"),
         }
 
-        let report: CheckPanicReport = CheckPanicReport {
-            panics: check_panics.iter().map(CheckPanic::from).collect(),
-        };
+        let report = CheckPanicReport::from_errors(&check_panics).unwrap();
         assert!(report.is_degraded());
+        assert_eq!(report.panics[0].check, "panic-check");
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Issue #722: a non-panic error must not turn into a fake "unknown" panic.
+    #[test]
+    fn check_panic_try_from_rejects_non_panic_errors() {
+        let parse = ScanError::Parse {
+            path: PathBuf::from("src/broken.rs"),
+            message: "expected `;`".to_string(),
+        };
+        let err = CheckPanic::try_from(&parse).unwrap_err();
+        assert!(matches!(err, ScanError::Parse { .. }));
+
+        let panic = ScanError::CheckPanic {
+            check: "panic-check".to_string(),
+            path: PathBuf::from("src/lib.rs"),
+            message: "boom".to_string(),
+        };
+        assert_eq!(
+            CheckPanic::try_from(&panic).unwrap(),
+            CheckPanic {
+                check: "panic-check".to_string(),
+                path: PathBuf::from("src/lib.rs"),
+                message: "boom".to_string(),
+            }
+        );
+    }
+
+    /// Issue #722: a report must not say "not degraded" about an error it can't represent.
+    #[test]
+    fn check_panic_report_from_errors_surfaces_non_panic_errors() {
+        let check_panic = || ScanError::CheckPanic {
+            check: "panic-check".to_string(),
+            path: PathBuf::from("src/lib.rs"),
+            message: "boom".to_string(),
+        };
+        let panic = check_panic();
+        let nested = ScanError::Multiple(vec![check_panic()]);
+        let report = CheckPanicReport::from_errors([&panic, &nested]).unwrap();
+        assert_eq!(report.len(), 2);
+        assert!(report.is_degraded());
+
+        let mixed = ScanError::Multiple(vec![
+            check_panic(),
+            ScanError::IoRead {
+                path: PathBuf::from("src/gone.rs"),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+        ]);
+        let err = CheckPanicReport::from_errors([&mixed]).unwrap_err();
+        assert!(matches!(err, ScanError::IoRead { .. }));
+
+        let empty = CheckPanicReport::from_errors(std::iter::empty()).unwrap();
+        assert!(!empty.is_degraded());
     }
 }
 
