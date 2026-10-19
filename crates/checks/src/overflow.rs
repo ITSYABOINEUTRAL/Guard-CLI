@@ -15,7 +15,28 @@ const INDEX_CHARS: &[&str] = &["i", "j", "k", "n", "x", "y", "z"];
 /// Variable-name fragments that suggest financial math → upgrade to High.
 const FINANCIAL_NAMES: &[&str] = &[
     "amount", "balance", "fee", "price", "supply", "reward", "stake", "fund", "value", "total",
+    "deposit", "discount",
 ];
+
+/// Split an identifier into lowercase words on `_` and camelCase boundaries.
+fn name_words(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if (c == '_' || (c.is_uppercase() && prev_lower)) && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        if c != '_' {
+            current.extend(c.to_lowercase());
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
 
 fn severity_for_operand_name(name: &str) -> Option<Severity> {
     let lower = name.to_lowercase();
@@ -24,10 +45,14 @@ fn severity_for_operand_name(name: &str) -> Option<Severity> {
             return Some(Severity::High);
         }
     }
-    for &idx in INDEX_NAMES {
-        if lower.contains(idx) {
-            return Some(Severity::Low);
-        }
+    // Match index fragments only at the start of a word (`idx`, `item_count`,
+    // `posIndex`), so financial names like `deposit`/`discount` don't collide
+    // with `pos`/`count` mid-word.
+    if name_words(name)
+        .iter()
+        .any(|word| INDEX_NAMES.iter().any(|idx| word.starts_with(idx)))
+    {
+        return Some(Severity::Low);
     }
     if INDEX_CHARS.contains(&lower.as_str()) {
         return Some(Severity::Low);
@@ -202,6 +227,23 @@ impl Visit<'_> for ArithVisitor<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn financial_names_with_index_substrings_stay_high() {
+        use super::{severity_for_operand_name as sev, Severity};
+        assert_eq!(sev("deposit"), Some(Severity::High));
+        assert_eq!(sev("discount"), Some(Severity::High));
+        assert_eq!(sev("user_deposit"), Some(Severity::High));
+    }
+
+    #[test]
+    fn index_names_still_low() {
+        use super::{severity_for_operand_name as sev, Severity};
+        assert_eq!(sev("item_count"), Some(Severity::Low));
+        assert_eq!(sev("posIndex"), Some(Severity::Low));
+        assert_eq!(sev("counter"), Some(Severity::Low));
+        assert_eq!(sev("i"), Some(Severity::Low));
+    }
+
     use super::*;
     use crate::Check;
     use syn::parse_file;

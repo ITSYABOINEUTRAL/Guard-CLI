@@ -13,6 +13,6 @@ impl HardcodedAddressVulnerable {
 
     // ❌ Soroban contract address (C-prefixed) baked into source — triggers hardcoded-address
     pub fn get_token(env: Env) -> Address {
-        Address::from_str(&env, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB5C")
+        Address::from_str(&env, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4")
     }
 }

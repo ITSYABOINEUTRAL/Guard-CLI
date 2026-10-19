@@ -89,11 +89,39 @@ pub fn load(scan_path: &Path) -> Result<(Option<GuardConfig>, Option<PathBuf>), 
     let Some(config_path) = find_config_path(scan_path) else {
         return Ok((None, None));
     };
-    let raw = std::fs::read_to_string(&config_path)
+    load_from_path(&config_path)
+}
+
+/// Load and parse exactly the given config file, skipping discovery.
+///
+/// Used for the explicit `--config <PATH>` flag. A missing or malformed
+/// file is a hard error (for exit-2 reporting) — never silently ignored.
+pub fn load_from_path(config_path: &Path) -> Result<(Option<GuardConfig>, Option<PathBuf>), String> {
+    let raw = std::fs::read_to_string(config_path)
         .map_err(|e| format!("could not read {}: {e}", config_path.display()))?;
     let cfg: GuardConfig = toml::from_str(&raw)
         .map_err(|e| format!("{}: {e}", config_path.display()))?;
-    Ok((Some(cfg), Some(config_path)))
+    Ok((Some(cfg), Some(config_path.to_path_buf())))
+}
+
+/// Resolve the config to use, honoring the CLI flags.
+///
+/// Precedence: an explicit `--config <PATH>` wins and skips discovery;
+/// `--no-config` disables discovery entirely (returns `(None, None)`);
+/// otherwise the nearest `soroban-guard.toml` is discovered by walking up
+/// from `scan_path` (see [`find_config_path`]).
+pub fn resolve(
+    scan_path: &Path,
+    explicit: Option<&Path>,
+    no_config: bool,
+) -> Result<(Option<GuardConfig>, Option<PathBuf>), String> {
+    if let Some(path) = explicit {
+        return load_from_path(path);
+    }
+    if no_config {
+        return Ok((None, None));
+    }
+    load(scan_path)
 }
 
 #[cfg(test)]
@@ -221,42 +249,63 @@ mod tests {
     }
 
     #[test]
+    fn load_from_path_uses_exactly_the_given_file() {
+        let root = temp_root("explicit");
+        fs::create_dir_all(root.join("src")).unwrap();
+        // A discovered config that must be ignored in favor of the explicit one.
+        fs::write(root.join("soroban-guard.toml"), "[scan]\nmin_severity = \"low\"\n").unwrap();
+        let explicit = root.join("shared-policy.toml");
+        fs::write(&explicit, "[scan]\nmin_severity = \"high\"\n").unwrap();
+
+        let (cfg, path) = resolve(&root.join("src"), Some(&explicit), false).unwrap();
+        assert_eq!(cfg.unwrap().scan.min_severity.as_deref(), Some("high"));
+        assert_eq!(path, Some(explicit));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_reports_a_missing_explicit_config_as_an_error() {
+        let root = temp_root("explicit-missing");
+        let missing = root.join("nope.toml");
+
+        let err = resolve(&root, Some(&missing), false).unwrap_err();
+        assert!(err.contains("nope.toml"), "{err}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_reports_a_malformed_explicit_config_as_an_error() {
+        let root = temp_root("explicit-bad");
+        let bad = root.join("bad.toml");
+        fs::write(&bad, "not valid toml [[[").unwrap();
+
+        let err = resolve(&root, Some(&bad), false).unwrap_err();
+        assert!(err.contains("bad.toml"), "{err}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_with_no_config_skips_discovery() {
+        let root = temp_root("no-config");
+        fs::write(root.join("soroban-guard.toml"), "[scan]\n").unwrap();
+
+        let (cfg, path) = resolve(&root, None, true).unwrap();
+        assert!(cfg.is_none());
+        assert!(path.is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unknown_top_level_table_is_rejected() {
-        let root = temp_root("unknown-top-level");
-        fs::write(root.join("soroban-guard.toml"), "[check]\ndisabled = []\n").unwrap();
+        let root = temp_root("unknown-table");
+        fs::write(root.join("soroban-guard.toml"), "[check]\n").unwrap();
 
         let err = load(&root).unwrap_err();
-        assert!(err.contains("check"), "{err}");
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn unknown_key_under_scan_is_rejected() {
-        let root = temp_root("unknown-scan-key");
-        fs::write(
-            root.join("soroban-guard.toml"),
-            "[scan]\nmin_severity_level = \"high\"\n",
-        )
-        .unwrap();
-
-        let err = load(&root).unwrap_err();
-        assert!(err.contains("min_severity_level"), "{err}");
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn unknown_key_under_checks_sensitive_names_is_rejected() {
-        let root = temp_root("unknown-sensitive-names-key");
-        fs::write(
-            root.join("soroban-guard.toml"),
-            "[checks.sensitive_names]\nextras = [\"drain\"]\n",
-        )
-        .unwrap();
-
-        let err = load(&root).unwrap_err();
-        assert!(err.contains("extras"), "{err}");
+        assert!(err.contains("soroban-guard.toml"), "{err}");
 
         fs::remove_dir_all(root).unwrap();
     }

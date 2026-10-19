@@ -145,10 +145,18 @@ Use [`crates/checks/src/auth.rs`](crates/checks/src/auth.rs) as the canonical la
 
 6. **Fixture crates** — Add `test-contracts/<rule>-vulnerable/` and `test-contracts/<rule>-safe/` (see below).
 
-7. **Update the all-findings example** — `CHANGELOG.md` claims `examples/all-findings/src/lib.rs`
-   "intentionally triggers every default check." Add a function there demonstrating your new rule
-   (with a `// Triggers <rule-name>` comment) so that claim stays true — this is easy to forget
-   since nothing enforces it automatically.
+7. **Update the all-findings example** — `examples/all-findings/src/lib.rs` intentionally triggers
+   every default check. Add a function there demonstrating your new rule, with a
+   ``// Triggers `my-rule` `` comment naming it.
+
+8. **Run the registry test** — `cargo test -p soroban-guard-checks --test registry_consistency`.
+   [`crates/checks/tests/registry_consistency.rs`](crates/checks/tests/registry_consistency.rs)
+   fails for every registered check that is missing any of steps 4, 6 and 7, and lists each problem:
+   - a ``## `my-rule` (Severity)`` heading in `docs/checks.md`;
+   - a ``// Triggers `my-rule` `` comment in `examples/all-findings/src/lib.rs` (or an entry, with
+     a reason, in its `TRIGGERS_ALLOW_LIST`);
+   - an entry in its `FIXTURES` table mapping `my-rule` to its fixture base name, with both
+     `test-contracts/<base>-vulnerable/src/lib.rs` and `<base>-safe/src/lib.rs` present.
 
 ---
 

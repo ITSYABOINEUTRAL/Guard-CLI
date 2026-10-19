@@ -58,7 +58,20 @@ impl Check for SelfTransferCheck {
     }
 }
 
+/// Ownership/admin handovers share the `transfer_` prefix but move no tokens and
+/// have no `from`/`to` pair to compare.
+const NON_TOKEN_TRANSFER_NAMES: &[&str] = &[
+    "transfer_ownership",
+    "transfer_admin",
+    "transfer_admin_role",
+    "transfer_authority",
+    "transfer_role",
+];
+
 fn is_transfer_like_name(name: &str) -> bool {
+    if NON_TOKEN_TRANSFER_NAMES.contains(&name) {
+        return false;
+    }
     name == "transfer"
         || name.starts_with("transfer_")
         || name.starts_with("safe_transfer")

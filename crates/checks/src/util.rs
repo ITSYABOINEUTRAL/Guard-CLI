@@ -372,6 +372,17 @@ pub(crate) fn pat_ident_name(pat: &Pat) -> Option<String> {
     }
 }
 
+/// Name fragments that mark a `let` binding read from storage as the
+/// privileged account (e.g. `admin`, `owner`). Shared so the admin, upgrade,
+/// and deployment checks can't drift apart.
+const ADMIN_VAR_KEYWORDS: &[&str] = &["admin", "authority", "owner", "caller"];
+
+/// `true` if `name` looks like a binding holding the privileged account.
+pub(crate) fn is_admin_var_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    ADMIN_VAR_KEYWORDS.iter().any(|k| lower.contains(k))
+}
+
 /// Names of every `Address`-typed parameter.
 pub fn address_param_names(sig: &Signature) -> Vec<String> {
     let mut names = Vec::new();

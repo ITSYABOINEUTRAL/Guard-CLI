@@ -21,7 +21,13 @@ impl Check for HardcodedAddressCheck {
     fn run(&self, file: &File, source: &str) -> Vec<Finding> {
         let mut out = Vec::new();
         let spans = function_spans(file);
+        let test_ranges = test_only_line_ranges(file);
         for (idx, line) in effective_lines(source).into_iter().enumerate() {
+            // Test-only code (a contract's own unit tests building a fake
+            // Address, say) is skipped, as every other check skips it.
+            if in_any_range(&test_ranges, idx + 1) {
+                continue;
+            }
             let raw_line = source.lines().nth(idx).unwrap_or("");
             if raw_line.trim_start().starts_with("#[doc") {
                 continue;
@@ -62,6 +68,52 @@ fn enclosing_function(spans: &[(usize, usize, String)], line: usize) -> &str {
         .find(|(start, end, _)| line >= *start && line <= *end)
         .map(|(_, _, name)| name.as_str())
         .unwrap_or("module")
+}
+
+/// 1-based, inclusive line ranges of test-only code: modules gated by
+/// `#[cfg(test)]` or named `tests` / `test` (the same rule as
+/// [`crate::util::contractimpl_functions_excluding_test`]), and any other item
+/// carrying `#[cfg(test)]` or `#[test]`. Spans include the item's attributes.
+fn test_only_line_ranges(file: &File) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    collect_test_ranges(&file.items, &mut out);
+    out
+}
+
+fn collect_test_ranges(items: &[syn::Item], out: &mut Vec<(usize, usize)>) {
+    for item in items {
+        let attrs: &[syn::Attribute] = match item {
+            syn::Item::Mod(m) => {
+                if crate::util::is_cfg_test(&m.attrs) || m.ident == "tests" || m.ident == "test" {
+                    out.push(line_range(item));
+                } else if let Some((_, nested)) = &m.content {
+                    collect_test_ranges(nested, out);
+                }
+                continue;
+            }
+            syn::Item::Fn(f) => &f.attrs,
+            syn::Item::Impl(i) => &i.attrs,
+            syn::Item::Const(c) => &c.attrs,
+            syn::Item::Static(st) => &st.attrs,
+            syn::Item::Struct(st) => &st.attrs,
+            syn::Item::Enum(e) => &e.attrs,
+            _ => continue,
+        };
+        if crate::util::is_cfg_test(attrs) || attrs.iter().any(|a| a.path().is_ident("test")) {
+            out.push(line_range(item));
+        }
+    }
+}
+
+fn line_range(item: &syn::Item) -> (usize, usize) {
+    let span = item.span();
+    (span.start().line, span.end().line)
+}
+
+fn in_any_range(ranges: &[(usize, usize)], line: usize) -> bool {
+    ranges
+        .iter()
+        .any(|(start, end)| line >= *start && line <= *end)
 }
 
 /// Line-range/name triples for every `#[contractimpl]` method in the file.
@@ -185,6 +237,21 @@ mod tests {
     use super::*;
     use crate::Check;
     use syn::parse_file;
+
+    /// Issue #733: the vulnerable fixture must demonstrate both the `G…` and the
+    /// `C…` detection its comments describe. A literal one character too long
+    /// fails the boundary checks and is silently never matched.
+    #[test]
+    fn vulnerable_fixture_flags_both_g_and_c_literals() -> Result<(), syn::Error> {
+        let source =
+            include_str!("../../../test-contracts/hardcoded-address-vulnerable/src/lib.rs");
+        let file = parse_file(source)?;
+        let findings = HardcodedAddressCheck.run(&file, source);
+        let mut flagged: Vec<&str> = findings.iter().map(|f| f.function_name.as_str()).collect();
+        flagged.sort_unstable();
+        assert_eq!(flagged, ["get_admin", "get_token"], "{findings:#?}");
+        Ok(())
+    }
 
     #[test]
     fn flags_hardcoded_address_in_string_literal() -> Result<(), syn::Error> {
@@ -313,6 +380,78 @@ impl C {{
             hits.is_empty(),
             "address inside a real line comment must not be flagged; hits: {hits:#?}"
         );
+        Ok(())
+    }
+
+    /// Issue #732: an address literal inside `#[cfg(test)] mod tests` is test
+    /// data, not a hardcoded production address.
+    #[test]
+    fn ignores_address_in_cfg_test_module() -> Result<(), syn::Error> {
+        let key = format!("G{}", "A".repeat(55));
+        let source = format!(
+            r#"
+use soroban_sdk::{{contractimpl, Address, Env}};
+
+pub struct C;
+
+#[contractimpl]
+impl C {{
+    pub fn ping(env: Env) {{
+        let _ = env;
+    }}
+}}
+
+#[cfg(test)]
+mod tests {{
+    use super::*;
+
+    #[test]
+    fn builds_fake_admin() {{
+        let env = Env::default();
+        let _admin = Address::from_str(&env, "{key}");
+    }}
+}}
+"#
+        );
+        let file = parse_file(&source)?;
+        let findings = HardcodedAddressCheck.run(&file, &source);
+        assert!(findings.is_empty(), "{findings:#?}");
+        Ok(())
+    }
+
+    /// `#[test]` / `#[cfg(test)]` on a free function or a `cfg(all(test, ..))`
+    /// module are test-only too; production code in the same file is still checked.
+    #[test]
+    fn skips_test_items_but_still_flags_production_code() -> Result<(), syn::Error> {
+        let key = format!("G{}", "B".repeat(55));
+        let source = format!(
+            r#"
+use soroban_sdk::{{contractimpl, Address, Env}};
+
+pub struct C;
+
+#[contractimpl]
+impl C {{
+    pub fn admin(env: Env) -> Address {{
+        Address::from_str(&env, "{key}")
+    }}
+}}
+
+#[test]
+fn free_test_fn() {{
+    let _ = "{key}";
+}}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod native_tests {{
+    const FAKE: &str = "{key}";
+}}
+"#
+        );
+        let file = parse_file(&source)?;
+        let findings = HardcodedAddressCheck.run(&file, &source);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].function_name, "admin");
         Ok(())
     }
 }

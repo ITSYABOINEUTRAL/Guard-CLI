@@ -133,13 +133,40 @@ impl<'ast> Visit<'ast> for NonceKeywordVisitor {
         visit::visit_macro(self, m);
     }
 
-    fn visit_expr_lit(&mut self, node: &'ast syn::ExprLit) {
-        if let syn::Lit::Str(s) = &node.lit {
-            if str_contains_nonce_keyword(&s.value()) {
+    // A bare string literal (a log tag, an event topic, an unused `let`) does
+    // not read a nonce. Only count literals used to build a key: arguments to
+    // `Symbol::new(..)` or to a storage call (`.get(&"nonce")`, `.set(..)`).
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(p) = &*node.func {
+            let mut segs = p.path.segments.iter().rev();
+            let is_symbol_new = segs.next().is_some_and(|s| s.ident == "new")
+                && segs.next().is_some_and(|s| s.ident == "Symbol");
+            if is_symbol_new && node.args.iter().any(is_nonce_str_lit) {
                 self.found = true;
             }
         }
-        visit::visit_expr_lit(self, node);
+        visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if receiver_chain_contains_storage(&node.receiver)
+            && node.args.iter().any(is_nonce_str_lit)
+        {
+            self.found = true;
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+}
+
+fn is_nonce_str_lit(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) => str_contains_nonce_keyword(&s.value()),
+        syn::Expr::Reference(r) => is_nonce_str_lit(&r.expr),
+        syn::Expr::Paren(p) => is_nonce_str_lit(&p.expr),
+        _ => false,
     }
 }
 
@@ -236,6 +263,43 @@ impl C {
         let check = MissingNonceCheck;
         let findings = check.run(&file, src);
         assert_eq!(findings.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn flags_unrelated_nonce_string_literals() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn update(env: Env, user: Address, new_val: u32) {
+        let tag = "sequence";
+        env.events().publish(("replay",), new_val);
+        log!(&env, "sequence");
+        env.storage().instance().set(&user, &new_val);
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let findings = MissingNonceCheck.run(&file, src);
+        assert_eq!(findings.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_nonce_string_used_as_storage_key() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn update(env: Env, user: Address, new_val: u32) {
+        let n: u64 = env.storage().instance().get(&"nonce").unwrap_or(0);
+        env.storage().instance().set(&Symbol::new(&env, "nonce"), &(n + 1));
+        env.storage().instance().set(&user, &new_val);
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let findings = MissingNonceCheck.run(&file, src);
+        assert_eq!(findings.len(), 0);
         Ok(())
     }
 

@@ -1,5 +1,12 @@
-
-//! Detection of duplicate symbol keys (symbol_short!("...")) within the same impl block.
+//! Detection of colliding symbol keys (`symbol_short!("...")` / `Symbol::new`)
+//! within the same impl block.
+//!
+//! A *collision* is one key string reached through two different sources: two
+//! named constants bound to the same literal, a named constant and an inline
+//! literal, or the same inline literal written in two different functions.
+//! Reusing one source is not a collision: reading and then writing a slot with
+//! the same `symbol_short!("key")` inside one function, or using the same
+//! `const` key twice, refers to the same storage entry on purpose.
 //!
 //! Two unrelated `#[contractimpl]` blocks in the same file that happen to reuse
 //! the same key name are **not** flagged — each impl block is checked in
@@ -11,6 +18,14 @@ use syn::visit::{self, Visit};
 use syn::{File, Lit, Macro};
 
 const CHECK_NAME: &str = "symbol-key-collision";
+
+/// One use of a key: (column, line, enclosing function for the report, source).
+///
+/// `source` identifies *where the key's value comes from*: `const NAME` for a
+/// named constant, otherwise `fn NAME` (or `module level`) for an inline
+/// literal. Occurrences that share a source are the same key on purpose.
+type Occurrence = (usize, usize, String, String);
+type KeyMap = std::collections::HashMap<String, Vec<Occurrence>>;
 
 /// Detect duplicate `symbol_short!` / `Symbol::new` literals within the same
 /// `impl` block.  Two independent `#[contractimpl]` blocks (different
@@ -33,19 +48,13 @@ impl Check for SymbolKeyCollisionCheck {
         // namespaces) reusing the same key name do not produce a false positive.
         // Module-level `const` declarations (outside any impl) are still
         // checked as a single group.
-        let mut module_level_keys: std::collections::HashMap<
-            String,
-            Vec<(usize, usize, String)>,
-        > = std::collections::HashMap::new();
+        let mut module_level_keys: KeyMap = KeyMap::new();
 
         for item in &file.items {
             match item {
                 syn::Item::Impl(impl_block) => {
                     // Each impl block gets its own key map.
-                    let mut impl_keys: std::collections::HashMap<
-                        String,
-                        Vec<(usize, usize, String)>,
-                    > = std::collections::HashMap::new();
+                    let mut impl_keys: KeyMap = KeyMap::new();
                     let mut visitor = SymbolKeyVisitor {
                         symbol_keys: &mut impl_keys,
                         str_consts: &str_consts,
@@ -71,13 +80,19 @@ impl Check for SymbolKeyCollisionCheck {
     }
 }
 
-fn emit_findings(
-    symbol_keys: &std::collections::HashMap<String, Vec<(usize, usize, String)>>,
-    findings: &mut Vec<Finding>,
-) {
+fn emit_findings(symbol_keys: &KeyMap, findings: &mut Vec<Finding>) {
     for (key, positions) in symbol_keys {
-        if positions.len() > 1 {
-            for (pos, line, fn_name) in positions.iter().skip(1) {
+        // Keep the first occurrence of each distinct source, in source order.
+        // Repeats from the same source are the same key on purpose.
+        let mut ordered: Vec<&Occurrence> = positions.iter().collect();
+        ordered.sort_by_key(|(col, line, _, _)| (*line, *col));
+        let mut seen_sources = std::collections::HashSet::new();
+        let distinct: Vec<&Occurrence> = ordered
+            .into_iter()
+            .filter(|(_, _, _, source)| seen_sources.insert(source.as_str()))
+            .collect();
+        if distinct.len() > 1 {
+            for (pos, line, fn_name, _) in distinct.iter().skip(1) {
                 let loc = if fn_name.is_empty() {
                     "module level".to_string()
                 } else {
@@ -109,7 +124,7 @@ fn emit_findings(
 }
 
 struct SymbolKeyVisitor<'a> {
-    symbol_keys: &'a mut std::collections::HashMap<String, Vec<(usize, usize, String)>>,
+    symbol_keys: &'a mut KeyMap,
     /// `const NAME: &str = "..."` declarations, so `Symbol::new(env, NAME)` can be
     /// resolved to its literal key and compared against `symbol_short!` literals.
     str_consts: &'a std::collections::HashMap<String, String>,
@@ -145,6 +160,20 @@ fn collect_str_consts(items: &[syn::Item], out: &mut std::collections::HashMap<S
     }
 }
 
+impl SymbolKeyVisitor<'_> {
+    /// Source label for an inline literal at the current position.
+    fn inline_source(&self) -> String {
+        if self.current_function.starts_with("const ") {
+            // `const NAME: Symbol = symbol_short!("...")` — the constant is the source.
+            self.current_function.clone()
+        } else if self.current_function.is_empty() {
+            "module level".to_string()
+        } else {
+            format!("fn {}", self.current_function)
+        }
+    }
+}
+
 impl<'ast, 'a> Visit<'ast> for SymbolKeyVisitor<'a> {
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         let prev = std::mem::replace(&mut self.current_function, node.sig.ident.to_string());
@@ -167,10 +196,13 @@ impl<'ast, 'a> Visit<'ast> for SymbolKeyVisitor<'a> {
                     let span = m.span().start();
                     let pos = span.column;
                     let line = span.line;
-                    self.symbol_keys
-                        .entry(key)
-                        .or_default()
-                        .push((pos, line, self.current_function.clone()));
+                    let source = self.inline_source();
+                    self.symbol_keys.entry(key).or_default().push((
+                        pos,
+                        line,
+                        self.current_function.clone(),
+                        source,
+                    ));
                 }
             }
         }
@@ -186,22 +218,28 @@ impl<'ast, 'a> Visit<'ast> for SymbolKeyVisitor<'a> {
                 if last == "new" && prev == "Symbol" {
                     let key = match node.args.iter().nth(1) {
                         Some(syn::Expr::Lit(expr_lit)) => match &expr_lit.lit {
-                            Lit::Str(s) => Some(s.value()),
+                            Lit::Str(s) => Some((s.value(), self.inline_source())),
                             _ => None,
                         },
                         // A named `const` key — the idiomatic way to declare keys.
-                        Some(syn::Expr::Path(p)) => p
-                            .path
-                            .get_ident()
-                            .and_then(|id| self.str_consts.get(&id.to_string()).cloned()),
+                        // The constant itself is the source, so using it twice is
+                        // not a collision; a second constant with the same value is.
+                        Some(syn::Expr::Path(p)) => p.path.get_ident().and_then(|id| {
+                            let name = id.to_string();
+                            self.str_consts
+                                .get(&name)
+                                .map(|v| (v.clone(), format!("const {name}")))
+                        }),
                         _ => None,
                     };
-                    if let Some(key) = key {
+                    if let Some((key, source)) = key {
                         let span = node.span().start();
-                        self.symbol_keys
-                            .entry(key)
-                            .or_default()
-                            .push((span.column, span.line, self.current_function.clone()));
+                        self.symbol_keys.entry(key).or_default().push((
+                            span.column,
+                            span.line,
+                            self.current_function.clone(),
+                            source,
+                        ));
                     }
                 }
             }
@@ -216,25 +254,62 @@ mod tests {
     use crate::Check;
     use syn::parse_file;
 
+    /// Issues #448 / #734: reading and later writing one entry with the same
+    /// literal inside a function is required usage, not a collision.
     #[test]
-    fn detects_duplicate_symbol_keys() {
+    fn same_key_reused_within_one_function_is_not_a_collision() {
         let src = r#"
-use soroban_sdk::{contractimpl, symbol_short, Symbol, Env};
+use soroban_sdk::{contractimpl, symbol_short, Env};
+
+pub struct Contract;
+
+#[contractimpl]
+impl Contract {
+    pub fn bump(env: Env) {
+        let n: u32 = env.storage().instance().get(&symbol_short!("count")).unwrap_or(0);
+        env.storage().instance().set(&symbol_short!("count"), &(n + 1));
+    }
+}
+"#;
+        let file = parse_file(src).unwrap();
+        let findings = SymbolKeyCollisionCheck.run(&file, src);
+        assert!(
+            findings.is_empty(),
+            "reusing one key inside a function must not be flagged; got: {findings:#?}"
+        );
+    }
+
+    /// Two *different* named constants bound to the same literal inside one impl
+    /// block are the canonical collision #448 asks the check to keep.
+    #[test]
+    fn detects_two_named_constants_bound_to_the_same_literal() {
+        let src = r#"
+use soroban_sdk::{contractimpl, Symbol, Env};
+
+const BALANCE: &str = "bal";
+const BALLOT: &str = "bal";
 
 pub struct Contract;
 
 #[contractimpl]
 impl Contract {
     pub fn foo(env: Env) {
-        let k1 = symbol_short!("key");
-        let k2 = symbol_short!("key");
+        let a = Symbol::new(&env, BALANCE);
+        let b = Symbol::new(&env, BALLOT);
+        let _ = (a, b);
     }
 }
 "#;
         let file = parse_file(src).unwrap();
         let findings = SymbolKeyCollisionCheck.run(&file, src);
-        assert_eq!(findings.len(), 1);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0].severity, Severity::Medium);
+        assert_eq!(findings[0].function_name, "foo");
+        assert!(
+            findings[0].description.contains("`bal`"),
+            "{}",
+            findings[0].description
+        );
     }
 
     #[test]
@@ -298,14 +373,11 @@ const OLD_ADMIN_KEY: Symbol = symbol_short!("bal");
         assert_eq!(findings[0].function_name, "const OLD_ADMIN_KEY");
     }
 
-    /// Regression coverage for the non-literal-second-argument gap: `Symbol::new(&env, CONST)`
-    /// inside a method, where `CONST` is a `&str` constant rather than an inline string
-    /// literal. `visit_expr_call` only recognizes `Symbol::new`'s second argument when it is a
-    /// `Lit::Str` directly, so a collision expressed through a shared `&str` constant is
-    /// currently **not** detected. This test documents that gap; it should start failing (i.e.
-    /// findings.len() should become 1) once the check is taught to resolve constant references.
+    /// Issue #616 / #735: `Symbol::new(&env, CONST)` is resolved to the
+    /// constant's value (the former "known gap" is closed). Using the *same*
+    /// constant twice is one key on purpose, so it is not a collision.
     #[test]
-    fn does_not_detect_in_method_symbol_new_collision_via_shared_const() {
+    fn symbol_new_reusing_one_shared_const_is_not_a_collision() {
         let src = r#"
 use soroban_sdk::{contractimpl, Symbol, Env};
 
@@ -324,10 +396,40 @@ impl Contract {
 "#;
         let file = parse_file(src).unwrap();
         let findings = SymbolKeyCollisionCheck.run(&file, src);
-        assert!(
-            findings.is_empty(),
-            "known gap: Symbol::new(&env, CONST) with a non-literal second argument is not \
-             yet resolved to its constant value, so no collision is detected here"
+        assert!(findings.is_empty(), "{findings:#?}");
+    }
+
+    /// Issue #616 / #735: the shared constant is resolved, so it collides with an
+    /// inline literal of the same value in another function of the same impl.
+    #[test]
+    fn detects_symbol_new_collision_via_shared_const() {
+        let src = r#"
+use soroban_sdk::{contractimpl, symbol_short, Symbol, Env};
+
+const OLD_ADMIN_KEY: &str = "bal";
+
+pub struct Contract;
+
+#[contractimpl]
+impl Contract {
+    pub fn balance(env: Env) {
+        let k = symbol_short!("bal");
+        let _ = k;
+    }
+    pub fn old_admin(env: Env) {
+        let k = Symbol::new(&env, OLD_ADMIN_KEY);
+        let _ = k;
+    }
+}
+"#;
+        let file = parse_file(src).unwrap();
+        let findings = SymbolKeyCollisionCheck.run(&file, src);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].function_name, "old_admin");
+        assert_eq!(findings[0].line, 15);
+        assert_eq!(
+            findings[0].description,
+            format!("Duplicate symbol key `bal` found at position {}", 16)
         );
     }
 

@@ -18,7 +18,10 @@ cli → analyzer → checks
 1. The CLI calls `scan_directory_with_checks` with the requested path and the config/CLI-filtered
    `active_checks` list — not `scan_directory`, since the CLI needs to honor `--disable-check` and
    `soroban-guard.toml`. `scan_directory` (the config-free variant) is used only by tests and the
-   fixture test helper.
+   fixture test helper. `scan_files`, which scans an explicit list of paths instead of walking a
+   directory, is library API for embedders (pre-commit hooks scanning staged files, editor
+   integrations). No CLI subcommand calls it, so its behavior is covered by
+   `crates/analyzer/tests/scan_files_api.rs` rather than by the CLI tests.
 2. The analyzer walks the directory and filters it to applicable `.rs` files.
 3. Each file is read and parsed with `syn::parse_file` into a `syn::File`.
 4. The analyzer calls `Check::run` for every check in `active_checks`.

@@ -180,7 +180,7 @@ Soroban contracts compile to WASM with `#![no_std]`. Importing from `std` causes
 
 **What it detects**
 
-A string literal anywhere in the file that matches the shape of a Stellar `StrKey` address — a 56-character base32 run starting with `G` (Ed25519 public key) or `C` (Soroban contract address), bounded by non-alphanumeric characters on both sides. Works on the raw source text rather than the parsed AST, so it catches addresses regardless of which expression they appear in.
+A string literal anywhere in the file that matches the shape of a Stellar `StrKey` address — a 56-character base32 run starting with `G` (Ed25519 public key) or `C` (Soroban contract address), bounded by non-alphanumeric characters on both sides. Works on the raw source text rather than the parsed AST, so it catches addresses regardless of which expression they appear in. Test-only code is skipped: modules gated by `#[cfg(test)]` (including `cfg(all(test, …))`) or named `tests`/`test`, and items marked `#[cfg(test)]` or `#[test]`.
 
 **Why it matters**
 
@@ -331,7 +331,13 @@ On-chain state changes should be accompanied by events so that off-chain indexer
 
 **What it detects**
 
-Within a single `#[contractimpl]` impl block: duplicate `symbol_short!("…")` keys used in `env.storage().instance().get(…)`, `.set(…)`, or `.has(…)` calls.
+Within a single `#[contractimpl]` impl block (and, separately, among module-level items): one storage key string reached through two different sources. A source is a named `const`, or an inline `symbol_short!("…")` / `Symbol::new(&env, "…")` literal in a given function. `Symbol::new(&env, CONST)` is resolved to the constant's value. Flagged, for example:
+
+- two different constants bound to the same literal (`const BALANCE: &str = "bal"; const BALLOT: &str = "bal";`)
+- a constant and an inline literal with the same value
+- the same inline literal written in two different functions of one impl
+
+Not flagged: reusing one source. Reading and then writing an entry with the same `symbol_short!("key")` inside one function, or using the same `const` key several times, refers to the same slot on purpose.
 
 **Why it matters**
 
@@ -339,8 +345,9 @@ Duplicate storage keys cause silent overwrites. Two contract functions writing d
 
 **Limitations**
 
-- Only compares keys that share the same `#[contractimpl]` block; cross-block duplicates are not detected.
-- Only `symbol_short!` is analyzed; `Symbol::new` with the same string literal is not matched.
+- Only compares keys that share the same `#[contractimpl]` block; separate impl blocks (separate contracts) are not compared, by design.
+- Constants are resolved only when they are `&str` literals declared in the same file.
+- An inline literal used in two functions is reported even when both functions deliberately share the slot; prefer a named `const` for shared keys.
 
 **Fixture:** Covered by inline `#[cfg(test)]` unit tests in `crates/checks/src/key_collision.rs`.
 

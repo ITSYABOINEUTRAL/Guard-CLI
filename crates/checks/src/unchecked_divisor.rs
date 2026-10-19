@@ -366,4 +366,43 @@ impl C {
         assert_eq!(findings.len(), 0, "checked_div should not be flagged");
         Ok(())
     }
+
+    #[test]
+    fn ignores_guarded_divisor_ne_zero_panic() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn divide(_env: Env, total: u128, divisor: u128) -> u128 {
+        if divisor != 0 {
+            total / divisor
+        } else {
+            panic!("zero divisor")
+        }
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let findings = UncheckedDivisorCheck.run(&file, src);
+        assert_eq!(findings.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn flags_division_when_only_other_variable_is_guarded() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn divide(_env: Env, total: u128, divisor: u128, other: u128) -> Option<u128> {
+        if other == 0 {
+            return None;
+        }
+        Some(total / divisor)
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let findings = UncheckedDivisorCheck.run(&file, src);
+        assert_eq!(findings.len(), 1);
+        Ok(())
+    }
 }

@@ -1,4 +1,5 @@
 use crate::util::{
+    is_admin_var_name,
     self, contractimpl_functions_excluding_test, env_param_name, pat_ident_name,
     receiver_chain_contains, receiver_chain_contains_storage,
 };
@@ -117,7 +118,7 @@ impl<'ast> Visit<'ast> for AuthScanner {
                     && receiver_chain_contains(&init.expr, "get")
                 {
                     if let Some(var_name) = pat_ident_name(&local.pat) {
-                        if var_name.to_lowercase().contains("admin") || var_name.to_lowercase().contains("authority") {
+                        if is_admin_var_name(&var_name) {
                             self.admin_vars.insert(var_name);
                         }
                     }

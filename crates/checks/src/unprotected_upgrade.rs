@@ -1,4 +1,5 @@
 use crate::util::{
+    is_admin_var_name,
     self, contractimpl_functions_excluding_test, env_param_name, pat_ident_name,
     receiver_chain_contains, receiver_chain_contains_storage,
 };
@@ -117,7 +118,7 @@ impl<'ast> Visit<'ast> for AuthScanner {
                     && receiver_chain_contains(&init.expr, "get")
                 {
                     if let Some(var_name) = pat_ident_name(&local.pat) {
-                        if var_name.to_lowercase().contains("admin") || var_name.to_lowercase().contains("authority") {
+                        if is_admin_var_name(&var_name) {
                             self.admin_vars.insert(var_name);
                         }
                     }
@@ -273,6 +274,24 @@ impl C {
         let check = UnprotectedUpgradeCheck;
         let findings = check.run(&file, src);
         assert!(findings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn passes_when_stored_owner_require_auth_precedes_upgrade() -> Result<(), syn::Error> {
+        let src = r#"
+#[contractimpl]
+impl C {
+    pub fn upgrade(env: Env, new_wasm: BytesN<32>) {
+        let owner: Address = env.storage().instance().get(&OWNER_KEY).unwrap();
+        owner.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm);
+    }
+}
+        "#;
+        let file = parse_file(src)?;
+        let findings = UnprotectedUpgradeCheck.run(&file, src);
+        assert_eq!(findings.len(), 0);
         Ok(())
     }
 

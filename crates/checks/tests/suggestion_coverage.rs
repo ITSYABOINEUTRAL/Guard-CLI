@@ -292,6 +292,9 @@ impl C {
     pub fn foo(env: Env) {
         let _ = env;
         let k1 = symbol_short!("key");
+    }
+    pub fn bar(env: Env) {
+        let _ = env;
         let k2 = symbol_short!("key");
     }
 }
